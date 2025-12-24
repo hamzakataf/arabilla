@@ -1,0 +1,313 @@
+برومبت شامل لوصف وتنفيذ Web App (Django) لمينيو إلكتروني (Arabella)
+================================================================================
+
+أنت مساعد برمجي. المطلوب منك أن تفهم وتنفّذ تطبيق Web App لمينيو إلكتروني للكافيه باستخدام Django (نسخة حديثة مثل 5.x) مع قاعدة بيانات SQLite أثناء التطوير، وقابل لاحقاً للتحويل إلى PostgreSQL. الواجهة عربية RTL ومهيّأة لشاشات الموبايل (خصوصاً أندرويد). المشروع اسمه: arabella
+التطبيق الأساسي داخل App اسمه: menu
+
+ملاحظة مهمّة جداً:
+- لا تعتمد على JavaScript في صفحات العميل (الزبون). كل شيء Server-Side باستخدام Django views + templates + GET/POST.
+- يمكن وجود JavaScript بسيط جداً في لوحة الأدمن فقط (اختياري: auto-refresh / toast)، لكن الأفضل أن تبقى الوظائف الأساسية تعمل بدون JS.
+
+----------------------------------------
+1) الهدف العام (Business Flow)
+----------------------------------------
+1) الزبون يمسح QR على الطاولة → يفتح رابط يحوي رقم الطاولة في QueryString (مثال: ?t=12).
+2) النظام يلتقط رقم الطاولة ويحفظه في session (table_no).
+3) الزبون يتصفح التصنيفات والمنتجات والعروض ويضيف للسلة.
+4) السلة تبقى محفوظة في session ولا تُفرّغ عند إضافة منتجات جديدة.
+5) عند الضغط "تأكيد الطلب" يتم إنشاء Order + OrderItems في قاعدة البيانات (snapshot لاسم/سعر/ملاحظات/كمية).
+6) بعد تأكيد الطلب: 
+   - يتم تفريغ "سلة الجلسة" (session cart) (اختيارياً) لكن يبقى الطلب محفوظاً في DB.
+   - يعاد توجيه المستخدم لصفحة نجاح/حالة الطلب.
+7) لوحة الأدمن تعرض الطلبات مفتوحة وتجمعها "حسب الطاولة" وتسمح بتغيير الحالة (new/preparing/ready/delivered) وزر "تم التنفيذ / إفراغ".
+8) عند "تم التنفيذ/إفراغ": يتم إنهاء الطلب (delivered أو done) وبذلك تعتبر الطاولة فارغة من الطلبات المفتوحة.
+
+ملاحظة حول "استمرار الطلب وإضافة عناصر لاحقاً":
+- الأفضل تصميمياً أن يكون لدى كل طاولة "طلب مفتوح واحد" (open order) ويمكن للزبون إضافة عناصر لاحقاً لنفس الطلب المفتوح.
+- عند تأكيد الطلب من الزبون:
+  - إذا يوجد Order مفتوح للطاولة (NEW أو PREPARING أو READY) → أضف عناصر جديدة على نفس الطلب (بدلاً من إنشاء Order جديد).
+  - إذا لا يوجد Order مفتوح → أنشئ Order جديد.
+- وبذلك عندما يضيف الزبون عناصر لاحقاً تظهر ضمن نفس كارد الطاولة في الأدمن.
+
+----------------------------------------
+2) الصفحات (Routes) المطلوبة
+----------------------------------------
+هذه أسماء URL patterns (لابد أن تتطابق مع templates واستخدام {% url %}):
+
+Client:
+- name="landing"      path=""
+- name="home"         path="home/"
+- name="offers"       path="offers/"
+- name="product_details" path="product/<slug:slug>/"
+- name="cart"         path="cart/"
+- name="cart_add"     path="cart/add/<slug:slug>/"
+- name="cart_add_offer" path="cart/add-offer/<int:offer_id>/"
+- name="cart_update_key" path="cart/update-key/"
+- name="cart_remove_key" path="cart/remove-key/"
+- name="set_table"    path="cart/set-table/"
+- name="checkout"     path="checkout/"
+- name="order_success" path="order/success/<int:order_id>/"
+- name="order_status"  path="order/status/<int:order_id>/"
+- name="offer_customize" path="offer/<slug:slug>/customize/"  (تخصيص العرض)
+
+Admin (Custom Panel):
+- name="admin_dashboard" path="panel/"
+- name="admin_set_status" path="panel/order/<int:order_id>/status/"
+- name="admin_done"       path="panel/order/<int:order_id>/done/"
+
+تنبيه: أي NoReverseMatch يعني أن template يستخدم اسم غير موجود أو يحتاج parameters مختلفة.
+
+----------------------------------------
+3) النماذج (Models) المطلوبة
+----------------------------------------
+Category:
+- name (unique)
+- slug (unique, indexed)
+- order (int)
+- is_active (bool)
+
+Product:
+- category (FK Category, PROTECT)
+- name
+- slug (unique)
+- description (optional)
+- price_syp (int)
+- image (optional)
+- is_active (bool)
+- is_featured (bool)
+- ordering: featured ثم name
+
+Offer:
+- title
+- subtitle (optional)
+- price_syp (int)
+- image (optional)
+- is_active (bool)
+- order (int)
+- slug (unique) auto-generated على save() بشكل فريد
+
+Order:
+- table_no (string indexed)
+- status choices: new, preparing, ready, delivered, canceled
+- note (optional)
+- total_syp (int)
+- created_at, updated_at
+
+OrderItem:
+- order (FK, CASCADE)
+- item_type: product/offer
+- product (nullable FK) or offer (nullable FK) واحد فقط حسب النوع
+- name_snapshot (string)
+- price_syp_snapshot (int)
+- qty (int)
+- note_snapshot (optional)
+- property line_total = price * qty
+
+----------------------------------------
+4) منطق السلة (Cart) داخل Session
+----------------------------------------
+- السلة محفوظة في request.session (مثلاً key="cart") وبداخلها items.
+- كل عنصر بالسلة لازم يملك "key" فريد حتى يدعم:
+  - تعديل كمية (cart_update_key)
+  - حذف (cart_remove_key)
+- خطوط السلة يمكن أن تكون نوعين:
+  - product: يعتمد على product_id
+  - offer: يعتمد على offer_id + note (تخصيص) لأن نفس العرض بتخصيص مختلف يعتبر سطر مختلف
+
+Operations:
+- add_product(session, product_id, qty) → يزيد الكمية لنفس المنتج (أو يضيف سطر)
+- add_offer(session, offer_id, qty, note) → يضيف سطر جديد حسب note أو يدمج حسب سياسة key
+- set_qty_key(session, key, qty) → إذا qty=0 احذف السطر
+- remove_key(session, key)
+- clear(session)
+- get_lines(session) → يرجّع (lines, total)
+
+يوجد helper:
+_cart_summary(session) → cart_count, cart_total
+
+----------------------------------------
+5) QR للطاولات (Table Capture)
+----------------------------------------
+آلية الالتقاط:
+- أي صفحة رئيسية (landing/home/cart...) تنفّذ:
+  t = request.GET.get("t")
+  إذا موجود: request.session["table_no"] = t
+
+الروابط التي تُطبع داخل QR:
+- أسهل خيار: رابط landing أو home مع باراميتر الطاولة:
+  مثال أثناء التطوير:
+  http://127.0.0.1:8000/?t=12
+  أو
+  http://127.0.0.1:8000/home/?t=12
+
+وعند النشر على الدومين:
+  https://YOUR-DOMAIN.COM/?t=12
+  (أو /home/?t=12 حسب التصميم)
+
+مهم: لازم تترك رقم الطاولة ضمن QR نفسه، كل طاولة QR مختلف.
+
+----------------------------------------
+6) صفحة Home: تصنيفات + بحث + منتجات (Server-Side)
+----------------------------------------
+المطلوب:
+- عرض categories ديناميكياً من DB.
+- عند الضغط على تصنيف: يرسل GET ?cat=slug
+- زر "الكل": يرجع cat=all
+- البحث: GET ?q=...
+- يجب دمج cat و q معاً بدون JS:
+  - عند البحث: حافظ على cat ضمن hidden input
+  - وعند الانتقال بين التصنيفات: حافظ على q باللينك
+
+داخل view home():
+- selected_cat = request.GET.get("cat","all")
+- q = request.GET.get("q","").strip()
+- products queryset:
+  - filter(is_active=True, category__is_active=True)
+  - إذا selected_cat != "all": filter(category__slug=selected_cat)
+  - إذا q: filter(name__icontains=q أو description__icontains=q)
+- أرسل للسياق:
+  categories, offers, products, cart_count, cart_total, selected_cat, q
+
+----------------------------------------
+7) صفحة العروض + تخصيص العرض
+----------------------------------------
+- صفحة offers.html تعرض كل العروض النشطة.
+- زر "اطلب الآن" يأخذك إلى offer_customize (slug).
+- offer-customize.html يعرض نموذج تخصيص (مثلاً drink/shisha/note) ثم POST إلى cart_add_offer(offer_id).
+- cart_add_offer:
+  - يبني note_snapshot من الحقول (مثلاً "مشروب: ... | أركيلة: ... | ملاحظة: ...")
+  - ثم cart_srv.add_offer(session, offer.id, qty, note_str)
+  - redirect إلى "cart"
+
+----------------------------------------
+8) صفحة cart.html (بدون JS)
+----------------------------------------
+- تعرض lines القادمة من view cart_page كقائمة UI.
+- كل سطر يجب أن يستخدم:
+  - it.key للتعديل والحذف
+  - it.title (وليس it.name) لأن الواجهة ترسل title
+  - it.qty, it.unit_price, it.line_total
+
+التعديل (+/-) يتم POST إلى cart_update_key مع:
+- key
+- qty الجديد (qty-1 أو qty+1)
+الحذف POST إلى cart_remove_key مع:
+- key
+
+يجب أن تكون أسماء urls صحيحة:
+- cart_update_key
+- cart_remove_key
+لا تستخدم cart_update أو cart_remove لأنها غير موجودة.
+
+----------------------------------------
+9) Checkout (إنشاء/تحديث الطلب المفتوح للطاولة)
+----------------------------------------
+المطلوب الأفضل:
+- عند POST /checkout/
+  - اقرأ table_no من POST أو من session.
+  - إذا لا يوجد table_no: اعرض خطأ.
+  - استخرج lines من cart.
+  - ابحث عن Order مفتوح للطاولة:
+      Order.objects.filter(table_no=table_no, status__in=["new","preparing","ready"]).order_by("-id").first()
+    - إذا وجد: استخدمه
+    - إذا لم يوجد: أنشئ Order جديد status=new
+  - أنشئ OrderItems snapshots لكل line (product/offer)
+  - حدّث total_syp = مجموع line_total لكل عناصر الطلب (سواء القديمة + الجديدة)
+  - لا تمسح OrderItems القديمة إذا الهدف هو إضافة عناصر؛ فقط أضف Items جديدة.
+  - (اختياري) امسح session cart بعد الإرسال: cart_srv.clear(session)
+  - redirect إلى order_success أو order_status
+
+صفحة order_status.html تعرض حالة الطلب الحالية.
+
+تنبيه: url name يجب أن يكون "order_status" وليس "order-status" (أو توحيدهما).
+
+----------------------------------------
+10) لوحة الأدمن الخاصة (Admin Panel /panel/)
+----------------------------------------
+- هذه لوحة مخصصة ليست Django admin.
+- تعتمد على admin_views.py و template: admin-dashboard.html
+
+مهم جداً: مكان القالب
+- إذا admin_views.py يعمل render(request, "admin-dashboard.html") 
+  يجب أن يكون الملف داخل:
+  C:/Users/LOQ/Desktop/WebApp/templates/admin-dashboard.html
+- أما إذا الملف داخل templates/admin/admin-dashboard.html
+  فيجب أن يكون render(request, "admin/admin-dashboard.html")
+
+وظيفة dashboard:
+- تعرض الطلبات المفتوحة فقط (status != delivered/canceled) أو حسب سياسة المشروع.
+- تجمع حسب الطاولات، وكل طاولة تظهر كـ Card.
+- داخل card: قائمة عناصر o.items.all مع:
+  - it.item_type (عرض/منتج)
+  - it.name_snapshot
+  - it.note_snapshot (إن وجدت)
+  - it.price_syp_snapshot
+  - it.qty
+  - it.line_total
+- تعرض o.total_syp.
+- أزرار لتغيير الحالة POST إلى admin_set_status:
+  status=preparing, ready
+- زر "تم التنفيذ/إفراغ" POST إلى admin_done:
+  - يغيّر status إلى delivered (أو done)
+  - يعتبر الطاولة فارغة من الطلبات المفتوحة.
+
+عرض إحصائيات:
+- open_orders = عدد الطلبات المفتوحة
+- active_tables = عدد الطاولات التي لديها طلب مفتوح
+
+----------------------------------------
+11) مشاكل شائعة تم حلها بالمشروع
+----------------------------------------
+1) NoReverseMatch:
+- سببه template يستدعي url name غير موجود أو ناقص parameters.
+- الحل: توحيد أسماء urls في urls.py مع templates.
+
+2) زر السلة لا يفتح:
+- غالباً بسبب أخطاء {% url %} داخل cart.html أو JS يوقف النقر.
+- يجب إزالة app.js من صفحات العميل إن لم يكن ضرورياً.
+
+3) زر التصنيفات لا يفلتر:
+- الحل: فلترة المنتجات في view home() عبر GET cat/q.
+
+4) admin-dashboard.html لا يُعثر عليه:
+- الحل: تعديل مسار render أو نقل الملف للمكان الصحيح.
+
+----------------------------------------
+12) متطلبات UI / Templates
+----------------------------------------
+Templates داخل مجلد:
+C:/Users/LOQ/Desktop/WebApp/templates/
+
+مقترح أسماء الملفات:
+- index.html           (landing)
+- home.html            (home)
+- offers.html          (offers list)
+- offer-customize.html (offer customize)
+- product.html         (product_details)
+- cart.html            (cart)
+- order-success.html   (order_success)
+- order-status.html    (order_status)
+- admin-dashboard.html (panel dashboard) أو داخل admin/ حسب قرارك
+
+Static:
+C:/Users/LOQ/Desktop/WebApp/static/
+- css/styles.css
+- css/admin.css
+- img/...
+
+RTL:
+<html lang="ar" dir="rtl">
+
+----------------------------------------
+13) التنفيذ المطلوب منك كمساعد
+----------------------------------------
+- تأكد من urls.py مطابق للـ names أعلاه.
+- راجع templates لتصحيح أي {% url %} غير صحيح.
+- نفّذ cart service بشكل ثابت في session.
+- نفّذ home filtering (cat + q) server-side.
+- نفّذ checkout بحيث يدمج على Order مفتوح للطاولة (حتى تظهر كل طلبات الطاولة بنفس الكارد بالأدمن).
+- تأكد من admin panel يعرض name_snapshot و title بشكل صحيح.
+- تأكد من مسار admin-dashboard template صحيح.
+- اعطِ كود جاهز للنسخ لكل ملف تحتاج تعديله (urls.py, views.py, admin_views.py, cart.py, templates الأساسية).
+
+نهاية البرومبت.
